@@ -73,20 +73,30 @@ def parse_time(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s)
 
 
+def to_number(s: pd.Series) -> pd.Series:
+    """Число из колонки; понимает десятичную запятую (CSV из русского Excel)."""
+    if not pd.api.types.is_numeric_dtype(s):
+        s = (s.astype(str).str.strip().str.replace("\u00a0", "", regex=False)
+             .str.replace(" ", "", regex=False).str.replace(",", ".", regex=False))
+    return pd.to_numeric(s, errors="coerce")
+
+
 def prepare(df, time_col, signal_col):
     """Возвращает таблицу time/open/high/low/close/signal, отсортированную по времени."""
     pc = find_price_columns(df)
     out = pd.DataFrame({
         "time": parse_time(df[time_col]),
-        "open": pd.to_numeric(df[pc["open"]], errors="coerce"),
-        "high": pd.to_numeric(df[pc["high"]], errors="coerce"),
-        "low": pd.to_numeric(df[pc["low"]], errors="coerce"),
-        "close": pd.to_numeric(df[pc["close"]], errors="coerce"),
+        "open": to_number(df[pc["open"]]),
+        "high": to_number(df[pc["high"]]),
+        "low": to_number(df[pc["low"]]),
+        "close": to_number(df[pc["close"]]),
         "signal": parse_signal(df[signal_col]),
     })
     bad = int(out[["open", "high", "low", "close"]].isna().any(axis=1).sum())
     out = out.dropna(subset=["time", "open", "high", "low", "close"])
     out = out.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    if out.empty:
+        raise ValueError("после разбора не осталось ни одной свечи — проверьте колонки цен и времени")
     return out, bad
 
 

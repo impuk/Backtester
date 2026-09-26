@@ -169,7 +169,7 @@ def _simulate_independent(o, h, l, c, cand, tp, sl, capital, amount, fee, slip,
                 else:
                     t_exit[nt] = -1
                     t_xprice[nt] = np.nan
-                    t_pnl[nt] = qty * c[n - 1] * (1.0 - fee) - cost_in
+                    t_pnl[nt] = qty * c[n - 1] * (1.0 - slip) * (1.0 - fee) - cost_in
                 nt += 1
                 if open_cnt > max_cnt:
                     max_cnt = open_cnt
@@ -311,7 +311,7 @@ def _simulate_average(o, h, l, c, cand, tp, sl, capital, amount, fee, slip,
     if pos_n > 0:  # открыта на конце данных
         t_exit[nt] = -1
         t_xprice[nt] = np.nan
-        t_pnl[nt] = pos_qty * c[n - 1] * (1.0 - fee) - pos_cost
+        t_pnl[nt] = pos_qty * c[n - 1] * (1.0 - slip) * (1.0 - fee) - pos_cost
         t_reason[nt] = REASON_OPEN
         nt += 1
     return nt, ns, nf, max_n, max_cost
@@ -462,13 +462,17 @@ class Dataset:
         self.lo_tree, _ = build_max_tree(-self.l)
 
 
+def num_threads():
+    return max(1, numba.get_num_threads())
+
+
 def run_grid(ds, tps, sls, capital, amount, fee, slip, mode):
     """tps, sls — одномерные массивы долей (0.01 = 1%) одинаковой длины."""
     return _grid(ds.o, ds.h, ds.l, ds.c, ds.cand,
                  np.ascontiguousarray(tps, np.float64),
                  np.ascontiguousarray(sls, np.float64),
                  float(capital), float(amount), float(fee), float(slip), int(mode),
-                 ds.hi_tree, ds.lo_tree, ds.size, max(1, numba.get_num_threads()))
+                 ds.hi_tree, ds.lo_tree, ds.size, num_threads())
 
 
 def run_detail(ds, tp, sl, capital, amount, fee, slip, mode):

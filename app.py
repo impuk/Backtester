@@ -2,7 +2,6 @@
 
 Запуск: streamlit run app.py
 """
-import hashlib
 import time
 
 import numpy as np
@@ -26,20 +25,21 @@ HEAT_METRICS = {
 }
 
 
+# file_id — ключ кэша; _raw не хешируется (иначе большой файл хешируется на каждом клике)
 @st.cache_data(show_spinner="Читаю CSV…", max_entries=3)
-def load_raw(raw: bytes):
-    return D.read_csv(raw)
+def load_raw(file_id: str, _raw: bytes):
+    return D.read_csv(_raw)
 
 
 @st.cache_data(show_spinner="Готовлю данные…", max_entries=3)
-def load_prepared(raw: bytes, time_col: str, signal_col: str):
-    return D.prepare(load_raw(raw), time_col, signal_col)
+def load_prepared(file_id: str, _raw: bytes, time_col: str, signal_col: str):
+    return D.prepare(load_raw(file_id, _raw), time_col, signal_col)
 
 
 def value_range(a, b, step):
     if step <= 0 or b < a:
         return np.array([])
-    n = int(round((b - a) / step)) + 1
+    n = int(np.floor((b - a) / step + 1e-9)) + 1  # не выходим за верхнюю границу
     return np.round(a + np.arange(n) * step, 4)
 
 
@@ -57,7 +57,7 @@ def make_datasets(bars, validation, split_pct):
 
 def run_with_progress(ds, tps, sls, p, bar, lo, hi):
     out = np.empty((len(tps), E.N_METRICS))
-    chunk = 96
+    chunk = max(96, E.num_threads() * 32)  # чтобы каждому потоку доставалось достаточно работы
     for s in range(0, len(tps), chunk):
         out[s:s + chunk] = E.run_grid(ds, tps[s:s + chunk], sls[s:s + chunk], p["capital"],
                                       p["amount"], p["fee"], p["slip"], p["mode"])
@@ -76,9 +76,9 @@ if up is None:
     st.stop()
 
 raw = up.getvalue()
-file_id = hashlib.md5(raw).hexdigest()
+file_id = f"{up.file_id}:{up.size}"
 try:
-    df_raw = load_raw(raw)
+    df_raw = load_raw(file_id, raw)
     D.find_price_columns(df_raw)
 except Exception as ex:  # noqa: BLE001
     st.error(f"Не удалось прочитать файл: {ex}")
@@ -93,7 +93,7 @@ if not sig_cands:
 sig_col = st.sidebar.selectbox("Колонка сигнала (long)", sig_cands,
                                index=sig_cands.index(D.default_signal_column(sig_cands)))
 try:
-    bars, bad_rows = load_prepared(raw, time_col, sig_col)
+    bars, bad_rows = load_prepared(file_id, raw, time_col, sig_col)
 except Exception as ex:  # noqa: BLE001
     st.error(f"Ошибка разбора данных: {ex}")
     st.stop()
@@ -166,9 +166,12 @@ if run:
         m_all = run_with_progress(sets["Весь файл"][0], tps, sls, params, bar, 0.0, 1.0)
         grid = R.grid_frame(tps, sls, m_all, params["mode"])
     bar.empty()
+    run_id = st.session_state.get("run_id", 0) + 1
+    st.session_state["run_id"] = run_id
     st.session_state["res"] = dict(params=params, grid=grid, sets=sets, elapsed=time.time() - t0,
-                                   tf_minutes=tf_minutes)
-    st.session_state.pop("sel", None)
+                                   tf_minutes=tf_minutes, run_id=run_id)
+    for k_ in ("sel", "grid_xlsx", "trades_xlsx"):
+        st.session_state.pop(k_, None)
     st.session_state["detail_cache"] = {}
 
 res = st.session_state.get("res")
@@ -185,7 +188,7 @@ grid = res["grid"]
 sets = res["sets"]
 mode = P["mode"]
 split = P["validation"] == "split"
-main_period = "Подбор" if split else "Весь файл"
+run_id = res.get("run_id", 0)
 
 mask = R.apply_filters(grid, f_trades if f_trades_on else None, f_dd if f_dd_on else None)
 passed = grid[mask]
@@ -198,7 +201,8 @@ st.caption(f"Режим: {[k for k, v in MODES.items() if v == mode][0]} · "
            f"{'подбор на ' + str(P['split']) + '% + проверка' if split else 'все данные'} · "
            f"комбинаций {len(grid):,} · расчёт {res['elapsed']:.1f} с")
 
-tabs = st.tabs(["Перебор", "Комбинация", "Проверка 70/30" if split else "Проверка", "Экспорт"])
+val_tab = f"Проверка {P['split']}/{100 - P['split']}" if split else "Проверка"
+tabs = st.tabs(["Перебор", "Комбинация", val_tab, "Экспорт"])
 
 # ================================================================== tab: grid
 with tabs[0]:
@@ -224,17 +228,19 @@ with tabs[0]:
     hm_src = h2.radio("Данные", ["Подбор", "Проверка"], horizontal=True) if split else "Подбор"
     hide = h3.checkbox("Скрыть не прошедшие фильтры", False)
     col, diverging, fmt = HEAT_METRICS[hm_name]
-    src_col = (R.TEST_PREFIX + col) if hm_src == "Проверка" else col
+    prefix = R.TEST_PREFIX if hm_src == "Проверка" else ""
+    src_col = prefix + col
+    profit_col = prefix + "Прибыль USDT"
     g2 = grid.copy()
     if hide:
-        g2.loc[~mask, src_col] = np.nan
+        g2.loc[~mask, [src_col, profit_col]] = np.nan
     best_xy = (best["TP %"], best["SL %"]) if best is not None else None
     p = R.pivot(g2, src_col)
     st.plotly_chart(R.heatmap(p, hm_name, diverging, fmt, best_xy), width="stretch")
 
     st.markdown("**Карта устойчивости** — средняя прибыль клетки и её соседей (±1 шаг TP и SL). "
                 "Широкая синяя зона надёжнее одиночного пика.")
-    pst = R.stability(R.pivot(g2, (R.TEST_PREFIX if hm_src == "Проверка" else "") + "Прибыль USDT"))
+    pst = R.stability(R.pivot(g2, profit_col))
     st.plotly_chart(R.heatmap(pst, "Средняя прибыль соседей, USDT", True, ",.2f", best_xy),
                     width="stretch")
 
@@ -251,11 +257,13 @@ with tabs[0]:
                if c not in ("TP %", "SL %")}
     ev = st.dataframe(top, width="stretch", hide_index=True, height=420,
                       on_select="rerun", selection_mode="single-row", column_config=num_cfg,
-                      key="top_table")
+                      # ключ зависит от содержимого: иначе выделение строки переживает смену
+                      # данных и указывает на чужую или несуществующую строку
+                      key=f"top_{run_id}_{hash(tuple(zip(top['TP %'], top['SL %'])))}")
     st.caption("Клик по заголовку колонки сортирует таблицу. Выберите строку, чтобы открыть "
                "её на вкладке «Комбинация».")
     rows = ev.selection.rows if ev is not None else []
-    if rows:
+    if rows and rows[0] < len(top):
         r = top.iloc[rows[0]]
         st.session_state["sel"] = (float(r["TP %"]), float(r["SL %"]))
 
@@ -325,8 +333,9 @@ with tabs[1]:
                for c in shown.columns if shown[c].dtype.kind == "f"}
         tev = st.dataframe(shown, width="stretch", hide_index=True, height=360,
                            on_select="rerun", selection_mode="single-row", column_config=cfg,
-                           key=f"trades_{period}_{tp_sel}_{sl_sel}")
-        trow = tdf.iloc[tev.selection.rows[0]] if tev.selection.rows else tdf.iloc[0]
+                           key=f"trades_{run_id}_{period}_{tp_sel}_{sl_sel}")
+        trows = [i for i in tev.selection.rows if i < len(tdf)]
+        trow = tdf.iloc[trows[0]] if trows else tdf.iloc[0]
         st.subheader(f"График: {'сделка' if mode == E.MODE_INDEPENDENT else 'позиция'} №{int(trow['№'])}")
         st.caption("Выберите строку в таблице выше, чтобы перейти к другой сделке.")
         fig, trunc = R.candle_figure(pbars, det, mode, tp_sel / 100, sl_sel / 100, trow)
@@ -431,13 +440,14 @@ with tabs[3]:
                         key="eper")
     edet = get_detail(eper, etp, esl)
     etdf = R.trades_frame(edet, sets[eper][1].time, mode, res["tf_minutes"])
-    name = f"trades_tp{etp:g}_sl{esl:g}"
+    name = f"trades_tp{etp:g}_sl{esl:g}" + ("" if eper == "Весь файл" else
+                                            "_train" if eper == "Подбор" else "_test")
     y1, y2 = st.columns(2)
     y1.download_button("Скачать CSV", R.to_csv(etdf) if len(etdf) else b"", f"{name}.csv", "text/csv",
                        disabled=etdf.empty)
     if y2.button("Подготовить Excel", key="tx", disabled=etdf.empty):
-        st.session_state["trades_xlsx"] = (name, R.to_excel({"Сделки": etdf}))
-    if "trades_xlsx" in st.session_state and st.session_state["trades_xlsx"][0] == name:
+        st.session_state["trades_xlsx"] = ((run_id, name), R.to_excel({"Сделки": etdf}))
+    if st.session_state.get("trades_xlsx", ((None,),))[0] == (run_id, name):
         y2.download_button("Скачать Excel", st.session_state["trades_xlsx"][1], f"{name}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            key="txd")
