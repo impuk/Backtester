@@ -66,11 +66,43 @@ def parse_signal(s: pd.Series) -> np.ndarray:
     return s.astype(str).str.strip().str.lower().isin(TRUE_VALUES).to_numpy()
 
 
+# Явные форматы времени, по порядку проверки. Первый — формат загрузчика BingX
+# (ДД-ММ-ГГГГ ЧЧ:ММ:СС), второй — прежние выгрузки (ГГГГ-ММ-ДД ЧЧ:ММ:СС).
+TIME_FORMATS = (
+    "%d-%m-%Y %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%d-%m-%Y %H:%M",
+    "%Y-%m-%d %H:%M",
+    "%d.%m.%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+)
+
+
 def parse_time(s: pd.Series) -> pd.Series:
+    """Разбирает время. Строки — только по явным форматам, без угадывания.
+
+    pd.to_datetime без формата угадывает его по первой строке и при дне <= 12
+    может тихо прочитать «05-01-2022» как 1 мая. Поэтому формат подбирается
+    так, чтобы им разбирались ВСЕ строки колонки.
+    """
     if pd.api.types.is_numeric_dtype(s):
         unit = "ms" if s.iloc[0] > 1e11 else "s"
         return pd.to_datetime(s, unit=unit)
-    return pd.to_datetime(s)
+    txt = s.astype(str).str.strip()
+    nonempty = txt[(txt != "") & (txt.str.lower() != "nan")]
+    for fmt in TIME_FORMATS:
+        parsed = pd.to_datetime(txt, format=fmt, errors="coerce")
+        if parsed[nonempty.index].notna().all():
+            return parsed
+    # запасной вариант: ISO 8601 (например, с часовым поясом или долями секунды)
+    try:
+        return pd.to_datetime(txt, format="ISO8601", utc=True).dt.tz_localize(None)
+    except (ValueError, TypeError):
+        example = nonempty.iloc[0] if len(nonempty) else ""
+        raise ValueError(
+            f"Не удалось разобрать время (пример: «{example}»). Ожидается формат "
+            "ДД-ММ-ГГГГ ЧЧ:ММ:СС или ГГГГ-ММ-ДД ЧЧ:ММ:СС.") from None
 
 
 def to_number(s: pd.Series) -> pd.Series:
