@@ -1,4 +1,4 @@
-"""Бэктестер сигналов: перебор TP/SL по CSV со свечами BingX.
+"""Бэктестер сигналов: перебор TP/SL по свечам BingX из CSV или Parquet.
 
 Запуск: streamlit run app.py
 """
@@ -26,14 +26,14 @@ HEAT_METRICS = {
 
 
 # file_id — ключ кэша; _raw не хешируется (иначе большой файл хешируется на каждом клике)
-@st.cache_data(show_spinner="Читаю CSV…", max_entries=3)
-def load_raw(file_id: str, _raw: bytes):
-    return D.read_csv(_raw)
+@st.cache_data(show_spinner="Читаю файл…", max_entries=3)
+def load_raw(file_id: str, name: str, _raw: bytes):
+    return D.read_file(name, _raw)
 
 
 @st.cache_data(show_spinner="Готовлю данные…", max_entries=3)
-def load_prepared(file_id: str, _raw: bytes, time_col: str, signal_col: str):
-    return D.prepare(load_raw(file_id, _raw), time_col, signal_col)
+def load_prepared(file_id: str, name: str, _raw: bytes, time_col: str, signal_col: str):
+    return D.prepare(load_raw(file_id, name, _raw), time_col, signal_col)
 
 
 def value_range(a, b, step):
@@ -68,17 +68,17 @@ def run_with_progress(ds, tps, sls, p, bar, lo, hi):
 
 # ================================================================== sidebar
 st.sidebar.title("Настройки")
-up = st.sidebar.file_uploader("CSV со свечами и сигналом", type=["csv"])
+up = st.sidebar.file_uploader("Файл со свечами и сигналом (CSV или Parquet)", type=["csv", "parquet"])
 if up is None:
     st.title("Бэктестер сигналов")
-    st.info("Загрузите CSV слева. Нужны колонки open, high, low, close, время и колонка "
-            "сигнала со значениями true/false.")
+    st.info("Загрузите CSV или Parquet слева. Нужны колонки open, high, low, close, время и "
+            "колонка сигнала со значениями true/false.")
     st.stop()
 
 raw = up.getvalue()
 file_id = f"{up.file_id}:{up.size}"
 try:
-    df_raw = load_raw(file_id, raw)
+    df_raw = load_raw(file_id, up.name, raw)
     D.find_price_columns(df_raw)
 except Exception as ex:  # noqa: BLE001
     st.error(f"Не удалось прочитать файл: {ex}")
@@ -88,12 +88,16 @@ cols = list(df_raw.columns)
 time_col = st.sidebar.selectbox("Колонка времени", cols, index=cols.index(D.guess_time_column(df_raw)))
 sig_cands = D.signal_candidates(df_raw)
 if not sig_cands:
-    st.error("Не нашёл колонку сигнала со значениями true/false.")
+    msg = "Не нашёл колонку сигнала со значениями true/false."
+    if D.is_parquet(up.name, raw):
+        msg += (" В Parquet загрузчика BingX только свечи — сигнал нужно добавить отдельной "
+                "колонкой (например, long_signal).")
+    st.error(msg)
     st.stop()
 sig_col = st.sidebar.selectbox("Колонка сигнала (long)", sig_cands,
                                index=sig_cands.index(D.default_signal_column(sig_cands)))
 try:
-    bars, bad_rows = load_prepared(file_id, raw, time_col, sig_col)
+    bars, bad_rows = load_prepared(file_id, up.name, raw, time_col, sig_col)
 except Exception as ex:  # noqa: BLE001
     st.error(f"Ошибка разбора данных: {ex}")
     st.stop()

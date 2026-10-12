@@ -1,4 +1,5 @@
-"""Проверки разбора времени в data.py."""
+"""Проверки чтения файлов и разбора времени в data.py."""
+import io
 import os
 import sys
 
@@ -58,6 +59,55 @@ def test_garbage_raises():
         assert "Не удалось разобрать время" in str(e)
     else:
         raise AssertionError("ожидалась ошибка")
+
+
+def parquet_bytes(df):
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="pyarrow", compression="zstd")
+    return buf.getvalue()
+
+
+def bingx_parquet(signal):
+    # как у загрузчика BingX 2.0: время — метка UTC в мс, цены float64, без close_time
+    t = pd.to_datetime([1643457600000, 1643461200000, 1643464800000], unit="ms", utc=True)
+    df = pd.DataFrame({"open_time_utc": t.astype("datetime64[ms, UTC]"),
+                       "open": [100.0, 101.0, 102.0], "high": [101.0, 102.0, 103.0],
+                       "low": [99.0, 100.0, 101.0], "close": [100.5, 101.5, 102.5],
+                       "volume_btc": [1.5, 2.5, 3.5]})
+    if signal is not None:
+        df["long_signal"] = signal
+    return parquet_bytes(df)
+
+
+def test_parquet_bool_signal():
+    raw = bingx_parquet([False, True, False])
+    df = D.read_file("BTC-USDT_1h.parquet", raw)
+    assert D.guess_time_column(df) == "open_time_utc"
+    assert D.signal_candidates(df) == ["long_signal"]
+    bars, bad = D.prepare(df, "open_time_utc", "long_signal")
+    assert bars.time.dt.tz is None
+    assert [t.strftime("%d-%m-%Y %H:%M:%S") for t in bars.time] == [
+        "29-01-2022 12:00:00", "29-01-2022 13:00:00", "29-01-2022 14:00:00"]
+    assert bars.signal.tolist() == [False, True, False] and bad == 0
+    assert D.timeframe_label(bars.time) == "1h"
+
+
+def test_parquet_int_signal_and_magic():
+    raw = bingx_parquet([0, 1, 1])
+    df = D.read_file("без_расширения", raw)          # узнаётся по сигнатуре PAR1
+    assert D.signal_candidates(df) == ["long_signal"]
+    bars, _ = D.prepare(df, "open_time_utc", "long_signal")
+    assert bars.signal.tolist() == [False, True, True]
+
+
+def test_parquet_without_signal():
+    df = D.read_file("BTC-USDT_1h.parquet", bingx_parquet(None))
+    assert D.signal_candidates(df) == []
+
+
+def test_csv_still_read_by_name():
+    df = D.read_file("x.csv", csv_bytes(["05-01-2022 00:00:00", "05-01-2022 01:00:00"]))
+    assert list(df.columns)[0] == "open_time_utc"
 
 
 if __name__ == "__main__":

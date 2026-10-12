@@ -1,4 +1,4 @@
-"""Загрузка CSV со свечами и сигналами."""
+"""Загрузка свечей и сигналов из CSV или Parquet."""
 import io
 
 import numpy as np
@@ -6,6 +6,7 @@ import pandas as pd
 
 PRICE_COLS = ("open", "high", "low", "close")
 TRUE_VALUES = {"true", "1", "1.0", "yes", "y", "t", "да"}
+PARQUET_MAGIC = b"PAR1"
 
 
 def read_csv(raw: bytes) -> pd.DataFrame:
@@ -16,6 +17,22 @@ def read_csv(raw: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(raw), sep=sep)
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
+
+def read_parquet(raw: bytes) -> pd.DataFrame:
+    """Читает Parquet (например, файл загрузчика BingX 2.0 с добавленной колонкой сигнала)."""
+    df = pd.read_parquet(io.BytesIO(raw), engine="pyarrow")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def is_parquet(name: str, raw: bytes) -> bool:
+    return name.lower().endswith(".parquet") or raw[:4] == PARQUET_MAGIC
+
+
+def read_file(name: str, raw: bytes) -> pd.DataFrame:
+    """CSV или Parquet — по расширению файла (или по сигнатуре Parquet в начале файла)."""
+    return read_parquet(raw) if is_parquet(name, raw) else read_csv(raw)
 
 
 def find_price_columns(df):
@@ -47,6 +64,13 @@ def signal_candidates(df):
         if s.dtype == bool:
             out.append(c)
             continue
+        if pd.api.types.is_datetime64_any_dtype(s):
+            continue
+        if pd.api.types.is_numeric_dtype(s):
+            # без перевода в строки: на миллионах строк Parquet это заметно быстрее
+            if s.isin([0, 1]).all():
+                out.append(c)
+            continue
         vals = set(s.astype(str).str.strip().str.lower().unique()[:10])
         if vals and vals <= {"true", "false", "0", "1", "0.0", "1.0", "yes", "no", "t", "f"}:
             out.append(c)
@@ -63,6 +87,8 @@ def default_signal_column(cands):
 def parse_signal(s: pd.Series) -> np.ndarray:
     if s.dtype == bool:
         return s.to_numpy()
+    if pd.api.types.is_numeric_dtype(s):
+        return (s.fillna(0) == 1).to_numpy()
     return s.astype(str).str.strip().str.lower().isin(TRUE_VALUES).to_numpy()
 
 
@@ -86,6 +112,12 @@ def parse_time(s: pd.Series) -> pd.Series:
     может тихо прочитать «05-01-2022» как 1 мая. Поэтому формат подбирается
     так, чтобы им разбирались ВСЕ строки колонки.
     """
+    if pd.api.types.is_datetime64_any_dtype(s):
+        # Parquet: уже метка времени; с часовым поясом (UTC у загрузчика) -> время UTC без пояса,
+        # в тех же единицах (мкс), что даёт разбор строк CSV
+        if s.dt.tz is not None:
+            s = s.dt.tz_convert(None)
+        return s.astype("datetime64[us]")
     if pd.api.types.is_numeric_dtype(s):
         unit = "ms" if s.iloc[0] > 1e11 else "s"
         return pd.to_datetime(s, unit=unit)
